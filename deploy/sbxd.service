@@ -1,0 +1,11 @@
+[Unit]
+Description=sbxd sandbox daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/project/sbx-demo/target/release/sbxd
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

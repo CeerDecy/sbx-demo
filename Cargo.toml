@@ -1,0 +1,3 @@
+[workspace]
+members = ["sbx-proto", "sbxd", "sbx-cli"]
+resolver = "3"

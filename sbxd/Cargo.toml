@@ -1,0 +1,12 @@
+[package]
+name = "sbxd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sbx-proto = { path = "../sbx-proto" }
+libc = "0.2.191"
+aya = "0.16.0"

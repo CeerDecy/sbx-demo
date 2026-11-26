@@ -1,0 +1,20 @@
+[package]
+name = "sbxd-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.3"
+aya-ebpf-bindings = "0.3"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Own workspace: this crate only builds for the BPF target, never for the host.
+[workspace]

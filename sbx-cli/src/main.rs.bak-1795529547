@@ -1,0 +1,281 @@
+use clap::{Parser, Subcommand, ValueEnum};
+use sbx_proto::{DEFAULT_SOCKET, ErrorBody, Request, Response};
+use serde_json::Value;
+use std::{
+    io,
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    process::exit,
+};
+
+/// Client for the sbxd sandbox daemon. All privileged work happens in the
+/// daemon; this binary only parses arguments and speaks the socket protocol.
+#[derive(Parser)]
+#[command(
+    name = "sbx",
+    version,
+    about = "gVisor sandbox client (talks to sbxd over a Unix socket)",
+    arg_required_else_help = true
+)]
+struct Cli {
+    /// Path to the sbxd Unix socket
+    #[arg(
+        long,
+        global = true,
+        env = "SBX_SOCKET",
+        value_name = "PATH",
+        default_value = DEFAULT_SOCKET
+    )]
+    socket: PathBuf,
+
+    /// Output format
+    #[arg(short = 'o', long, global = true, value_enum, default_value_t = Output::Table)]
+    output: Output,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Output {
+    /// Human readable output
+    Table,
+    /// Raw daemon response
+    Json,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a sandbox together with its own network namespace
+    New {
+        /// Sandbox id: lowercase letters, digits and dash
+        id: String,
+
+        /// Base bundle directory (defaults to the daemon's configured bundle)
+        #[arg(long, value_name = "DIR")]
+        bundle: Option<String>,
+
+        /// Reserved: GPU device injection is not implemented
+        #[arg(long)]
+        gpu: bool,
+    },
+
+    /// List sandboxes with their address and network namespace
+    Ls,
+
+    /// Stop a sandbox and remove its network
+    Rm {
+        /// Sandbox id
+        id: String,
+    },
+
+    /// Run one command inside a sandbox
+    Run {
+        /// Sandbox id
+        id: String,
+
+        /// Command and arguments (everything after the id)
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "CMD"
+        )]
+        argv: Vec<String>,
+    },
+
+    /// Open an interactive shell inside a sandbox
+    Shell {
+        /// Sandbox id
+        id: String,
+    },
+
+    /// Reserved: attach a GPU to a sandbox
+    GpuAttach {
+        /// Sandbox id
+        id: String,
+    },
+}
+
+impl From<Command> for Request {
+    fn from(command: Command) -> Self {
+        match command {
+            Command::New { id, bundle, gpu } => Request::New { id, bundle, gpu },
+            Command::Ls => Request::Ls {},
+            Command::Rm { id } => Request::Rm { id },
+            Command::Run { id, argv } => Request::Run { id, argv },
+            Command::Shell { id } => Request::Attach { id, shell: true },
+            Command::GpuAttach { id } => Request::GpuAttach { id },
+        }
+    }
+}
+
+fn fail(resp: Response) -> ! {
+    let e = resp.error.unwrap_or(ErrorBody {
+        code: sbx_proto::ErrorCode::IoError,
+        message: "unknown daemon error".into(),
+    });
+    eprintln!("{}", e.message);
+    exit(1)
+}
+
+fn field<'a>(data: &'a Value, key: &str) -> &'a str {
+    data.get(key).and_then(Value::as_str).unwrap_or("-")
+}
+
+/// Left-aligned columns with two spaces between them, sized to the content.
+fn print_table(header: &[&str], rows: &[Vec<String>]) {
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let render = |cells: &[String]| {
+        let mut line = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i + 1 == cells.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(cell);
+                for _ in cell.chars().count()..widths[i] + 2 {
+                    line.push(' ');
+                }
+            }
+        }
+        line
+    };
+    let head: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+    println!("{}", render(&head));
+    for row in rows {
+        println!("{}", render(row));
+    }
+}
+
+fn render_new(data: &Value) {
+    println!("sandbox/{} created", field(data, "id"));
+    println!(
+        "  address   {}  (ident {})",
+        field(data, "sbx_ip"),
+        field(data, "ident")
+    );
+    println!(
+        "  host      {} = {}/31",
+        field(data, "veth"),
+        field(data, "host_ip")
+    );
+    println!("  netns     {}", field(data, "netns"));
+    println!("  bundle    {}", field(data, "bundle"));
+}
+
+fn render_ls(data: &Value) {
+    let mut rows: Vec<Vec<String>> = data
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    vec![
+                        field(item, "id").to_string(),
+                        field(item, "status").to_string(),
+                        field(item, "address").to_string(),
+                        field(item, "netns").to_string(),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        eprintln!("No sandboxes found.");
+        return;
+    }
+    rows.sort();
+    print_table(&["ID", "STATUS", "ADDRESS", "NETNS"], &rows);
+}
+
+/// `run` passes the child's streams through untouched, like `kubectl exec`.
+fn render_run(data: &Value) {
+    if let Some(out) = data.get("stdout").and_then(Value::as_str) {
+        print!("{out}");
+    }
+    if let Some(err) = data.get("stderr").and_then(Value::as_str) {
+        eprint!("{err}");
+    }
+}
+
+fn render(request: &Request, data: &Value) {
+    match request {
+        Request::New { .. } => render_new(data),
+        Request::Ls {} => render_ls(data),
+        Request::Rm { .. } => println!("sandbox/{} removed", field(data, "id")),
+        Request::Run { .. } => render_run(data),
+        _ => println!("{}", serde_json::to_string_pretty(data).unwrap_or_default()),
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let socket = cli.socket;
+    let output = cli.output;
+    let request: Request = cli.command.into();
+
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}: {e}", socket.display());
+            exit(1)
+        }
+    };
+    if let Err(e) = sbx_proto::write_line(&mut stream, &request) {
+        eprintln!("{e}");
+        exit(1)
+    }
+    let line = match sbx_proto::read_line(&mut stream) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            exit(1)
+        }
+    };
+    let resp: Response = match serde_json::from_slice(&line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            exit(1)
+        }
+    };
+    if !resp.ok {
+        fail(resp)
+    }
+
+    // `shell` uses a raw byte splice; no termios/raw mode or job control.
+    if matches!(&request, Request::Attach { .. }) {
+        let mut input = io::stdin();
+        let mut output_stream = io::stdout();
+        let socket_in = stream.try_clone().expect("clone socket");
+        let t = std::thread::spawn(move || {
+            let mut socket_in = socket_in;
+            let _ = io::copy(&mut input, &mut socket_in);
+            let _ = socket_in.shutdown(Shutdown::Write);
+        });
+        let _ = io::copy(&mut stream, &mut output_stream);
+        let _ = t.join();
+        return;
+    }
+
+    let data = resp.data.unwrap_or(Value::Null);
+    match output {
+        Output::Json => println!("{}", serde_json::to_string_pretty(&data).unwrap()),
+        Output::Table => render(&request, &data),
+    }
+
+    // `run` propagates the sandboxed command's exit status so callers can
+    // branch on it, while `new`/`rm`/`ls` always exit 0 on success.
+    if matches!(&request, Request::Run { .. })
+        && let Some(code) = data.get("code").and_then(Value::as_i64)
+    {
+        exit(code.clamp(0, 255) as i32);
+    }
+}

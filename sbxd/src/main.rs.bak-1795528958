@@ -1,0 +1,850 @@
+use anyhow::{Context, Result, anyhow};
+use sbx_proto::{DEFAULT_SOCKET, ErrorBody, ErrorCode, Request, Response};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::{self, Read, Write},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+
+#[derive(Clone, Debug)]
+struct Config {
+    socket: PathBuf,
+    runsc: String,
+    runsc_root: String,
+    bundles: PathBuf,
+    default_bundle: PathBuf,
+    state: PathBuf,
+    mainnic: String,
+    subnet: String,
+    ident: String,
+}
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct State {
+    next_index: u32,
+    entries: Vec<Value>,
+}
+struct Daemon {
+    config: Config,
+    state: Arc<Mutex<State>>,
+    lifecycle: Mutex<()>,
+}
+struct Rollback<'a> {
+    active: bool,
+    ns: String,
+    veth: String,
+    daemon: &'a Daemon,
+    old_index: u32,
+    started_id: Option<String>,
+}
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(id) = &self.started_id {
+            let c = &self.daemon.config;
+            let _ = command_status(&c.runsc, &["--root", &c.runsc_root, "kill", id, "KILL"]);
+            let _ = command_status(&c.runsc, &["--root", &c.runsc_root, "delete", id]);
+        }
+        let _ = command_status("ip", &["netns", "del", &self.ns]);
+        let _ = command_status(
+            "iptables",
+            &["-D", "FORWARD", "-i", &self.veth, "-j", "ACCEPT"],
+        );
+        let _ = command_status(
+            "iptables",
+            &[
+                "-D",
+                "FORWARD",
+                "-o",
+                &self.veth,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+        );
+        if let Ok(mut state) = self.daemon.state.lock() {
+            state.next_index = self.old_index;
+            if let Some(id) = &self.started_id {
+                state
+                    .entries
+                    .retain(|entry| entry["id"].as_str() != Some(id));
+            }
+        }
+    }
+}
+
+fn error(code: ErrorCode, message: impl Into<String>) -> anyhow::Error {
+    ErrorBody::new(code, message).into()
+}
+fn response_error(err: anyhow::Error) -> Response {
+    Response::failure(
+        err.downcast_ref::<ErrorBody>()
+            .cloned()
+            .unwrap_or_else(|| ErrorBody::new(ErrorCode::IoError, format!("{err:#}"))),
+    )
+}
+fn command_output(program: &str, args: &[&str]) -> io::Result<Output> {
+    Command::new(program).args(args).output()
+}
+fn command_status(program: &str, args: &[&str]) -> io::Result<()> {
+    let output = command_output(program, args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+fn valid_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 31
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+fn derive_indices(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.get(1).is_none_or(|name| !name.starts_with("v-")) {
+                return None;
+            }
+            fields
+                .get(3)?
+                .split('/')
+                .next()?
+                .rsplit('.')
+                .next()?
+                .parse::<u32>()
+                .ok()
+                .map(|octet| octet / 2)
+        })
+        .collect()
+}
+#[cfg(test)]
+fn derive_max_index(output: &str) -> u32 {
+    derive_indices(output).into_iter().max().unwrap_or(0)
+}
+fn live_indices() -> Result<Vec<u32>> {
+    let output = command_output("ip", &["-o", "-4", "addr", "show"])?;
+    if !output.status.success() {
+        return Err(error(
+            ErrorCode::CommandFailed,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(derive_indices(&String::from_utf8_lossy(&output.stdout)))
+}
+// Lowest free index. Indices held by a live veth or by a recorded sandbox are
+// both off limits, so a freed index is reused instead of the pool drifting
+// upward on every create/remove cycle.
+fn allocate_index(entries: &[Value]) -> Result<u32> {
+    let mut taken: std::collections::BTreeSet<u32> = live_indices()?.into_iter().collect();
+    for entry in entries {
+        if let Some(index) = entry.get("index").and_then(Value::as_u64) {
+            taken.insert(u32::try_from(index).unwrap_or(u32::MAX));
+        }
+    }
+    (1u32..=127)
+        .find(|index| !taken.contains(index))
+        .ok_or_else(|| {
+            error(
+                ErrorCode::CommandFailed,
+                "sandbox address pool exhausted (indices 1..127)",
+            )
+        })
+}
+fn patch_config(path: &Path, ns: &str) -> Result<()> {
+    let mut config: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    let namespaces = config
+        .pointer_mut("/linux/namespaces")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            error(
+                ErrorCode::InvalidRequest,
+                "config.json has no linux.namespaces array",
+            )
+        })?;
+    let mut found = false;
+    for namespace in namespaces {
+        if namespace.get("type").and_then(Value::as_str) == Some("network") {
+            *namespace = json!({"type":"network", "path":format!("/var/run/netns/{ns}")});
+            found = true;
+        }
+    }
+    if !found {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "config.json has no network namespace entry",
+        ));
+    }
+    if !config.get("process").is_some_and(Value::is_object) {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "config.json has no process object",
+        ));
+    }
+    config["process"]["args"] = json!(["/bin/sh", "-c", "while :; do sleep 3600; done"]);
+    config["process"]["terminal"] = json!(false);
+    // Replace the inode, never write through the base bundle's hardlink.
+    atomic_write(path, &serde_json::to_vec_pretty(&config)?)?;
+    Ok(())
+}
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".sbxd-{}-{}", std::process::id(), unique_id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        if let Ok(meta) = fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+fn unique_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let dest_path = destination.join(entry.file_name());
+        if fs::symlink_metadata(&dest_path).is_ok() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(source_path)?, dest_path)?;
+        } else if metadata.is_dir() {
+            copy_tree(&source_path, &dest_path)?;
+        } else if metadata.is_file() {
+            if fs::hard_link(&source_path, &dest_path).is_err() {
+                fs::copy(&source_path, &dest_path)?;
+                fs::set_permissions(dest_path, metadata.permissions())?;
+            }
+        } else {
+            return Err(error(
+                ErrorCode::IoError,
+                format!("unsupported bundle file: {}", source_path.display()),
+            ));
+        }
+    }
+    fs::set_permissions(destination, fs::metadata(source)?.permissions())?;
+    Ok(())
+}
+fn sandbox_exists(c: &Config, id: &str) -> Result<bool> {
+    let output = command_output(&c.runsc, &["--root", &c.runsc_root, "list"])?;
+    if !output.status.success() {
+        return Err(error(
+            ErrorCode::CommandFailed,
+            format!("runsc list: {}", String::from_utf8_lossy(&output.stderr)),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().next() == Some(id)))
+}
+fn persist(daemon: &Daemon) -> Result<()> {
+    let state = daemon.state.lock().unwrap();
+    if let Some(parent) = daemon.config.state.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(&daemon.config.state, &serde_json::to_vec_pretty(&*state)?)?;
+    Ok(())
+}
+fn new_sandbox(daemon: &Daemon, id: String, bundle: Option<String>, gpu: bool) -> Result<Value> {
+    let c = &daemon.config;
+    if !valid_id(&id) {
+        return Err(error(
+            ErrorCode::InvalidId,
+            format!("invalid id '{id}' (lowercase letters, digits, dash)"),
+        ));
+    }
+    if gpu {
+        return Err(error(
+            ErrorCode::NotImplemented,
+            "GPU device injection is not implemented",
+        ));
+    }
+    let base = bundle
+        .map(PathBuf::from)
+        .unwrap_or_else(|| c.default_bundle.clone());
+    if !base.join("rootfs").is_dir() {
+        return Err(error(
+            ErrorCode::IoError,
+            format!("no rootfs under {}", base.display()),
+        ));
+    }
+    let _lifecycle = daemon.lifecycle.lock().unwrap();
+    let ns = format!("sbx-{id}");
+    let veth = format!("v-{id}");
+    if Path::new("/var/run/netns").join(&ns).exists() || sandbox_exists(c, &id)? {
+        return Err(error(
+            ErrorCode::AlreadyExists,
+            format!("sandbox or network namespace '{id}' already exists"),
+        ));
+    }
+    let state = daemon.state.lock().unwrap();
+    let old_index = state.next_index;
+    let index = allocate_index(&state.entries)?;
+    drop(state);
+    let host_ip = format!("10.30.0.{}", index * 2);
+    let sbx_ip = format!("10.30.0.{}", index * 2 + 1);
+    command_status("ip", &["netns", "add", &ns])
+        .map_err(|e| error(ErrorCode::IoError, e.to_string()))?;
+    let mut rollback = Rollback {
+        active: true,
+        ns: ns.clone(),
+        veth: veth.clone(),
+        daemon,
+        old_index,
+        started_id: None,
+    };
+    daemon.state.lock().unwrap().next_index = index + 1;
+    let host_cidr = format!("{host_ip}/31");
+    let sbx_cidr = format!("{sbx_ip}/31");
+    let ident_cidr = format!("{}/32", c.ident);
+    let network: Vec<Vec<String>> = vec![
+        vec![
+            "link", "add", &veth, "type", "veth", "peer", "name", "eth0", "netns", &ns,
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        vec!["addr", "add", &host_cidr, "dev", &veth]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        vec!["link", "set", &veth, "up"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        vec!["netns", "exec", &ns, "ip", "link", "set", "lo", "up"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        vec![
+            "netns", "exec", &ns, "ip", "addr", "add", &sbx_cidr, "dev", "eth0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        vec![
+            "netns",
+            "exec",
+            &ns,
+            "ip",
+            "addr",
+            "add",
+            &ident_cidr,
+            "dev",
+            "eth0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        vec!["netns", "exec", &ns, "ip", "link", "set", "eth0", "up"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        vec![
+            "netns", "exec", &ns, "ip", "route", "add", "default", "via", &host_ip, "src", &sbx_ip,
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+    ];
+    for args in network {
+        command_status("ip", &args.iter().map(String::as_str).collect::<Vec<_>>())
+            .map_err(|e| error(ErrorCode::IoError, e.to_string()))?;
+    }
+    let forward_rules = [
+        vec!["-i", &veth, "-j", "ACCEPT"],
+        vec![
+            "-o",
+            &veth,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ],
+    ];
+    for rule in forward_rules {
+        let check = [&["-C", "FORWARD"][..], &rule[..]].concat();
+        if command_status("iptables", &check).is_err() {
+            let add = [&["-A", "FORWARD"][..], &rule[..]].concat();
+            command_status("iptables", &add)
+                .map_err(|e| error(ErrorCode::IoError, e.to_string()))?;
+        }
+    }
+    let nat = [
+        "-t",
+        "nat",
+        "-C",
+        "POSTROUTING",
+        "-s",
+        &c.subnet,
+        "-o",
+        &c.mainnic,
+        "-j",
+        "MASQUERADE",
+    ];
+    if command_status("iptables", &nat).is_err() {
+        let add = [
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            &c.subnet,
+            "-o",
+            &c.mainnic,
+            "-j",
+            "MASQUERADE",
+        ];
+        command_status("iptables", &add).map_err(|e| error(ErrorCode::IoError, e.to_string()))?;
+    }
+    let private_bundle = c.bundles.join(format!("sbx-{id}"));
+    if private_bundle.exists() {
+        let marker = match fs::read_to_string(private_bundle.join(".base-bundle")) {
+            Ok(marker) => Some(marker),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if marker
+            .as_ref()
+            .is_some_and(|m| m.trim_end() != base.to_string_lossy())
+        {
+            return Err(error(
+                ErrorCode::AlreadyExists,
+                format!(
+                    "{} exists from a different base bundle ({})",
+                    private_bundle.display(),
+                    marker.as_deref().unwrap_or("").trim()
+                ),
+            ));
+        }
+    } else {
+        copy_tree(&base, &private_bundle)?;
+    }
+    atomic_write(
+        &private_bundle.join(".base-bundle"),
+        format!("{}\n", base.display()).as_bytes(),
+    )?;
+    patch_config(&private_bundle.join("config.json"), &ns)?;
+    // A detached runsc child may retain stderr; a regular file cannot keep us
+    // waiting for EOF. Unlink immediately, retaining the open descriptor.
+    let stderr_path =
+        std::env::temp_dir().join(format!("sbxd-start-{}-{}", std::process::id(), unique_id()));
+    let stderr_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)?;
+    fs::remove_file(&stderr_path)?;
+    let status = Command::new(&c.runsc)
+        .args([
+            "--nvproxy",
+            "--nvproxy-allowed-driver-capabilities=compute,utility",
+            "--platform=systrap",
+            "--network=host",
+            "--root",
+            &c.runsc_root,
+            "run",
+            "-detach",
+            "-bundle",
+        ])
+        .arg(&private_bundle)
+        .arg(&id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file.try_clone()?))
+        .status()?;
+    if !status.success() {
+        use std::io::{Seek, SeekFrom};
+        let mut file = stderr_file;
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        return Err(error(
+            ErrorCode::CommandFailed,
+            format!(
+                "sandbox '{id}' failed to start: {}",
+                String::from_utf8_lossy(&bytes).trim()
+            ),
+        ));
+    }
+    rollback.started_id = Some(id.clone());
+    let result = json!({"id":id,"bundle":private_bundle,"netns":ns,"veth":veth,"host_ip":host_ip,"sbx_ip":sbx_ip,"ident":c.ident,"index":index});
+    daemon.state.lock().unwrap().entries.push(result.clone());
+    persist(daemon)?;
+    rollback.active = false;
+    Ok(result)
+}
+fn list_sandboxes(c: &Config) -> Result<Value> {
+    let output = command_output(&c.runsc, &["--root", &c.runsc_root, "list"])?;
+    if !output.status.success() {
+        return Err(error(
+            ErrorCode::CommandFailed,
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    let mut result = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let Some(id) = fields.first() else {
+            continue;
+        };
+        let ns = format!("sbx-{id}");
+        let address = command_output(
+            "ip",
+            &[
+                "netns", "exec", &ns, "ip", "-4", "-o", "addr", "show", "eth0",
+            ],
+        )
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .nth(3)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "none".into());
+        let netns = if Path::new("/var/run/netns").join(&ns).exists() {
+            ns
+        } else {
+            "(none)".into()
+        };
+        result.push(json!({"id":id,"status":fields.get(2).copied().unwrap_or("unknown"),"address":address,"netns":netns}));
+    }
+    Ok(json!(result))
+}
+fn run_sandbox(c: &Config, id: String, argv: Vec<String>) -> Result<Value> {
+    if !valid_id(&id) {
+        return Err(error(ErrorCode::InvalidId, "invalid id"));
+    }
+    if argv.is_empty() {
+        return Err(error(ErrorCode::InvalidRequest, "argv must not be empty"));
+    }
+    let mut command = Command::new(&c.runsc);
+    command
+        .args(["--root", &c.runsc_root, "exec", &id])
+        .args(argv);
+    let output = command.stdin(Stdio::null()).output()?;
+    Ok(
+        json!({"code":output.status.code().unwrap_or(-1),"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr)}),
+    )
+}
+fn remove_sandbox(daemon: &Daemon, id: String) -> Result<Value> {
+    if !valid_id(&id) {
+        return Err(error(ErrorCode::InvalidId, "invalid id"));
+    }
+    let c = &daemon.config;
+    let ns = format!("sbx-{id}");
+    let _life = daemon.lifecycle.lock().unwrap();
+    if !Path::new("/var/run/netns").join(&ns).exists() && !sandbox_exists(c, &id)? {
+        return Err(error(
+            ErrorCode::NotFound,
+            format!("no such sandbox '{id}'"),
+        ));
+    }
+    let _ = command_status(&c.runsc, &["--root", &c.runsc_root, "kill", &id, "KILL"]);
+    thread::sleep(Duration::from_secs(1));
+    let _ = command_status(&c.runsc, &["--root", &c.runsc_root, "delete", &id]);
+    let _ = command_status("ip", &["netns", "del", &ns]);
+    let veth = format!("v-{id}");
+    let _ = command_status("iptables", &["-D", "FORWARD", "-i", &veth, "-j", "ACCEPT"]);
+    let _ = command_status(
+        "iptables",
+        &[
+            "-D",
+            "FORWARD",
+            "-o",
+            &veth,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ],
+    );
+    daemon
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .retain(|v| v.get("id").and_then(Value::as_str) != Some(&id));
+    persist(daemon)?;
+    Ok(json!({"id":id,"removed":true}))
+}
+fn dispatch(daemon: &Daemon, request: Request) -> Result<Value> {
+    match request {
+        Request::New { id, bundle, gpu } => new_sandbox(daemon, id, bundle, gpu),
+        Request::Ls {} => list_sandboxes(&daemon.config),
+        Request::Run { id, argv } => run_sandbox(&daemon.config, id, argv),
+        Request::Rm { id } => remove_sandbox(daemon, id),
+        Request::GpuAttach { .. } => Err(error(
+            ErrorCode::NotImplemented,
+            "GPU attach is not implemented",
+        )),
+        Request::Attach { .. } => Err(error(
+            ErrorCode::InvalidRequest,
+            "attach must be handled on its connection",
+        )),
+    }
+}
+fn prepare_attach(daemon: &Daemon, id: &str, shell: bool) -> Result<(std::process::Child, String)> {
+    if !valid_id(id) {
+        return Err(error(ErrorCode::InvalidId, "invalid id"));
+    }
+    if !shell {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "attach requires shell=true",
+        ));
+    }
+    if !sandbox_exists(&daemon.config, id)? {
+        return Err(error(
+            ErrorCode::NotFound,
+            format!("no such sandbox '{id}'"),
+        ));
+    }
+    let bash = daemon
+        .config
+        .bundles
+        .join(format!("sbx-{id}/rootfs/bin/bash"));
+    let shell = if bash
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    let child = Command::new(&daemon.config.runsc)
+        .args(["--root", &daemon.config.runsc_root, "exec", id, shell, "-i"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    Ok((child, shell.to_owned()))
+}
+fn attach(daemon: &Daemon, stream: &mut UnixStream, id: &str, shell: bool) -> Result<()> {
+    // Duplicate socket handles before spawning so setup failure cannot orphan a child.
+    let mut input = stream.try_clone()?;
+    let mut output = stream.try_clone()?;
+    let mut errors = stream.try_clone()?;
+    let (mut child, shell) = prepare_attach(daemon, id, shell)?;
+    if let Err(e) =
+        sbx_proto::write_line(stream, &Response::success(json!({"id":id,"shell":shell})))
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e.into());
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let incoming = thread::spawn(move || {
+        let _ = io::copy(&mut input, &mut stdin);
+    });
+    let outgoing = thread::spawn(move || {
+        let _ = io::copy(&mut stdout, &mut output);
+    });
+    let error_output = thread::spawn(move || {
+        let _ = io::copy(&mut stderr, &mut errors);
+    });
+    if let Err(e) = child.wait() {
+        eprintln!("attach wait: {e}");
+    }
+    let _ = outgoing.join();
+    let _ = error_output.join();
+    // Unblock a socket reader even when the local terminal is still open.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = incoming.join();
+    Ok(())
+}
+fn handle(daemon: Arc<Daemon>, mut stream: UnixStream) {
+    let request = sbx_proto::read_line(&mut stream)
+        .map_err(|e| ErrorBody::new(ErrorCode::InvalidRequest, e.to_string()))
+        .and_then(|line| {
+            serde_json::from_slice::<Request>(&line)
+                .map_err(|e| ErrorBody::new(ErrorCode::InvalidRequest, e.to_string()))
+        });
+    let response = match request {
+        Ok(Request::Attach { id, shell }) => match attach(&daemon, &mut stream, &id, shell) {
+            Ok(()) => return,
+            Err(e) => response_error(e),
+        },
+        Ok(request) => dispatch(&daemon, request)
+            .map(Response::success)
+            .unwrap_or_else(response_error),
+        Err(error) => Response::failure(error),
+    };
+    let _ = sbx_proto::write_line(&mut stream, &response);
+}
+fn parse_args() -> Result<Config> {
+    let mut c = Config {
+        socket: PathBuf::from(DEFAULT_SOCKET),
+        runsc: "/opt/gvisor/runsc".into(),
+        runsc_root: "/var/run/runsc-gpu".into(),
+        bundles: "/opt/gvisor/bundles".into(),
+        default_bundle: "/opt/gvisor/bundles/alpine".into(),
+        state: "/var/lib/sbxd/state.json".into(),
+        mainnic: "wlo1".into(),
+        subnet: "10.30.0.0/16".into(),
+        ident: "169.254.0.21".into(),
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+        match arg.as_str() {
+            "--socket" => c.socket = value.into(),
+            "--runsc" => c.runsc = value,
+            "--runsc-root" => c.runsc_root = value,
+            "--bundles" => c.bundles = value.into(),
+            "--default-bundle" => c.default_bundle = value.into(),
+            "--state" => c.state = value.into(),
+            "--mainnic" => c.mainnic = value,
+            "--subnet" => c.subnet = value,
+            "--ident" => c.ident = value,
+            _ => return Err(anyhow!("unknown flag {arg}")),
+        }
+    }
+    Ok(c)
+}
+// Minimal libc ABI use, without a dependency: root ownership and an atomic
+// restrictive socket mode must be established before any worker threads exist.
+unsafe extern "C" {
+    fn geteuid() -> u32;
+    fn umask(mask: u32) -> u32;
+}
+fn main() -> Result<()> {
+    let c = parse_args()?;
+    if unsafe { geteuid() } != 0 {
+        return Err(anyhow!("sbxd must run as root"));
+    }
+    unsafe {
+        umask(0o077);
+    }
+    let state = match fs::read(&c.state) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid daemon state")?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => State::default(),
+        Err(e) => return Err(e.into()),
+    };
+    let daemon = Arc::new(Daemon {
+        config: c.clone(),
+        state: Arc::new(Mutex::new(state)),
+        lifecycle: Mutex::new(()),
+    });
+    if let Some(parent) = c.socket.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&c.socket) {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            return Err(anyhow!(
+                "refusing to remove non-socket {}",
+                c.socket.display()
+            ));
+        }
+        match UnixStream::connect(&c.socket) {
+            Ok(_) => return Err(anyhow!("socket {} is already in use", c.socket.display())),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(&c.socket)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let listener = UnixListener::bind(&c.socket)?;
+    fs::set_permissions(&c.socket, fs::Permissions::from_mode(0o600))?;
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let daemon = daemon.clone();
+                thread::spawn(move || handle(daemon, stream));
+            }
+            Err(e) => eprintln!("connection: {e}"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn id_validation() {
+        assert!(valid_id("a-1"));
+        assert!(valid_id("z"));
+        assert!(!valid_id("A"));
+        assert!(!valid_id("-a"));
+        assert!(!valid_id("a_1"));
+        assert!(!valid_id(&"a".repeat(32)));
+    }
+    #[test]
+    fn index_derivation() {
+        assert_eq!(
+            derive_max_index(
+                "3: v-alpha    inet 10.30.0.2/31 scope global v-alpha\n9: eth0 inet 10.30.0.99/24"
+            ),
+            1
+        );
+        assert_eq!(
+            derive_max_index("3: v-a inet 10.30.0.8/31\n4: v-b inet 10.30.0.13/31"),
+            6
+        );
+    }
+    #[test]
+    fn patching() {
+        let dir = std::env::temp_dir().join(format!("sbxd-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        fs::write(&path,r#"{"linux":{"namespaces":[{"type":"pid"},{"type":"network","foo":1}]},"process":{"args":["old"],"terminal":true}}"#).unwrap();
+        patch_config(&path, "sbx-a").unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["linux"]["namespaces"][1]["path"], "/var/run/netns/sbx-a");
+        assert_eq!(v["process"]["terminal"], false);
+        assert_eq!(
+            v["process"]["args"],
+            json!(["/bin/sh", "-c", "while :; do sleep 3600; done"])
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
